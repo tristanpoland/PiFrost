@@ -130,8 +130,78 @@ impl DockerClient {
         Ok(stdout)
     }
 
+    /// Auto-attach any USB storage devices to WSL2 via usbipd (Windows only).
+    #[cfg(target_os = "windows")]
+    fn ensure_usb_storage_attached(&self) {
+        // Check if usbipd is available
+        let has_usbipd = Command::new("usbipd")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !has_usbipd {
+            println!("    installing usbipd (USB passthrough for WSL2)...");
+            let _ = Command::new("winget")
+                .args(["install", "--accept-source-agreements", "--accept-package-agreements",
+                    "usbipd", "-h"])
+                .output();
+            // Refresh PATH
+            match Command::new("powershell")
+                .args(["-NoProfile", "-Command",
+                    "& {[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','Machine'), 'Process')}"])
+                .output()
+            {
+                Ok(_) => (),
+                Err(_) => return,
+            }
+        }
+
+        // List USB devices and find unattached storage ones
+        let output = match Command::new("usbipd")
+            .args(["wsl", "list"])
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("BUSID") || line.starts_with('─') {
+                continue;
+            }
+            let lower = line.to_lowercase();
+            // Skip already attached devices
+            if lower.contains("attached") && !lower.contains("not attached") {
+                continue;
+            }
+            // Look for storage-related devices
+            let is_storage = lower.contains("storage") || lower.contains("card")
+                || lower.contains("flash") || lower.contains("usb disk")
+                || lower.contains("mass") || lower.contains("sd");
+            if !is_storage && !lower.contains("card") {
+                continue;
+            }
+            // Extract BUSID (first whitespace-delimited token)
+            let busid = line.split_whitespace().next().unwrap_or("");
+            if busid.is_empty() || busid == "BUSID" {
+                continue;
+            }
+            println!("    attaching USB storage ({}) via usbipd...", line);
+            let _ = Command::new("usbipd")
+                .args(["wsl", "attach", "--busid", busid])
+                .output();
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    }
+
     /// List available block devices visible inside the container.
     pub fn list_disks(&self) -> Result<Vec<String>> {
+        #[cfg(target_os = "windows")]
+        self.ensure_usb_storage_attached();
+
         let script = r#"
             lsblk -d -o NAME,SIZE,TYPE,MODEL -n 2>/dev/null | while read name size type model; do
                 echo "/dev/$name  ($size, $type, $model)"
@@ -143,6 +213,10 @@ impl DockerClient {
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
             .collect();
+        if disks.is_empty() {
+            #[cfg(target_os = "windows")]
+            println!("No disks found inside Docker. Is your USB drive attached to WSL2?");
+        }
         Ok(disks)
     }
 

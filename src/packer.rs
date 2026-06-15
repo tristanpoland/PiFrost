@@ -148,14 +148,14 @@ DISK_IMAGE=/host-output/stateless-debian-kube.img
 rm -f "$DISK_IMAGE"
 
 echo "=== Creating raw disk image ==="
-dd if=/dev/zero of="$DISK_IMAGE" bs=1M count=5000 status=progress
+dd if=/dev/zero of="$DISK_IMAGE" bs=1M count=4609 status=progress
 
 echo "=== Partitioning ==="
 parted -s "$DISK_IMAGE" mklabel gpt
 parted -s "$DISK_IMAGE" mkpart primary fat32 1MiB 513MiB
 parted -s "$DISK_IMAGE" set 1 esp on
 parted -s "$DISK_IMAGE" set 1 boot on
-parted -s "$DISK_IMAGE" mkpart primary ext4 513MiB 100%
+parted -s "$DISK_IMAGE" mkpart primary ext4 513MiB 4609MiB
 
 echo "=== Setting up loopback ==="
 LOOP=$(losetup --show -f "$DISK_IMAGE")

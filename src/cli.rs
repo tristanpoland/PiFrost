@@ -202,6 +202,7 @@ fn cmd_bootstrap(args: BootstrapArgs) -> Result<()> {
 }
 
 fn cmd_flash(args: FlashArgs) -> Result<()> {
+    #[cfg(not(target_os = "windows"))]
     let docker = DockerClient::new()?;
 
     let drive = match &args.drive {
@@ -211,6 +212,16 @@ fn cmd_flash(args: FlashArgs) -> Result<()> {
                 "{}",
                 ">>> No --drive specified. Scanning for available disks...".bold().yellow()
             );
+            #[cfg(target_os = "windows")]
+            let disks = {
+                let raw = crate::winflash::list_physical_drives().context("Failed to list disks")?;
+                raw.iter()
+                    .map(|(idx, model, size)| {
+                        format!("\\\\.\\PhysicalDrive{}  ({} - {})", idx, crate::winflash::format_size(*size), model)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            #[cfg(not(target_os = "windows"))]
             let disks = docker.list_disks().context("Failed to list disks")?;
             if disks.is_empty() {
                 anyhow::bail!("No block devices found. Insert a drive and retry.");
@@ -228,9 +239,25 @@ fn cmd_flash(args: FlashArgs) -> Result<()> {
         confirm_destructive_action(&drive)?;
     }
 
-    docker
-        .flash_drive(&drive, &args.image)
-        .context("Drive flash failed")?;
+    #[cfg(target_os = "windows")]
+    {
+        // Extract drive number from "\\.\PhysicalDriveN" or "\\.\PhysicalDriveN  (...)"
+        let trimmed = drive.trim_start_matches(r"\\.\PhysicalDrive")
+            .trim_start_matches(r"\\.\PHYSICALDRIVE");
+        let idx: u32 = trimmed.split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap_or("")
+            .parse()
+            .with_context(|| format!("Cannot parse drive number from '{}'", drive))?;
+        crate::winflash::flash_image_to_drive(&args.image, idx)
+            .context("Drive flash failed")?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        docker
+            .flash_drive(&drive, &args.image)
+            .context("Drive flash failed")?;
+    }
 
     println!();
     println!(
