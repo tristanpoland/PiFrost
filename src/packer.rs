@@ -139,8 +139,15 @@ echo "=== Building nixos-install-tools ==="
 nix build --no-sandbox --out-link /host-output/install-tools \
   nixpkgs#nixos-install-tools
 
-echo "=== Installing disk utilities ==="
-apk add --no-cache parted e2fsprogs dosfstools util-linux rsync
+echo "=== Building disk utilities ==="
+mkdir -p /host-output/tools/bin
+for pkg in parted e2fsprogs dosfstools utillinux rsync gnused; do
+  nix build --no-sandbox --out-link "/host-output/tools/$pkg" "nixpkgs#$pkg" 2>&1
+  if [ -d "/host-output/tools/$pkg/bin" ]; then
+    cp -r "/host-output/tools/$pkg/bin/"* /host-output/tools/bin/ 2>/dev/null || true
+  fi
+done
+export PATH="/host-output/tools/bin:$PATH"
 
 echo "=== Creating raw disk image ==="
 DISK_IMAGE=/host-output/stateless-debian-kube.img
