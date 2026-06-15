@@ -1,0 +1,8 @@
+/target/
+/output/
+*.img
+*.img.gz
+*.iso
+build.vars.pkr.hcl
+.DS_Store
+Thumbs.db

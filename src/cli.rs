@@ -1,0 +1,266 @@
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use colored::*;
+
+use crate::docker::DockerClient;
+use crate::packer::PackerManager;
+
+#[derive(Parser)]
+#[command(
+    name = "pifrost",
+    about = "Immutable K3s node image baker & bare-metal provisioner",
+    version,
+    long_about = "pifrost bakes immutable Debian 12 images with Packer, partitions \
+    bare-metal media via Docker isolation, and seeds automated Kubernetes nodes."
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Bake a stateless Debian K3s image using Packer
+    Bake(BakeArgs),
+    /// Wipe, partition, and pre-seed a drive for zero-touch autoinstall
+    Bootstrap(BootstrapArgs),
+    /// Flash OS partitions while preserving Kube data partition
+    Flash(FlashArgs),
+}
+
+#[derive(clap::Args, Clone)]
+pub struct BakeArgs {
+    /// Target CPU architecture
+    #[arg(long, default_value = "amd64", value_parser = clap::builder::PossibleValuesParser::new(["amd64", "arm64"]))]
+    pub arch: String,
+
+    /// UUID for the persistent kube-state partition
+    #[arg(long, default_value = "deadbeef-1234-5678-9abc-def012345678")]
+    pub kube_uuid: String,
+
+    /// Output directory for the baked image
+    #[arg(long, default_value = "./output")]
+    pub output_dir: String,
+
+    /// Force rebuild even if output exists
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+}
+
+#[derive(clap::Args, Clone)]
+pub struct BootstrapArgs {
+    /// Target block device (e.g., /dev/sdb). If omitted, lists available disks interactively.
+    #[arg(long)]
+    pub drive: Option<String>,
+
+    /// Node hostname
+    #[arg(long, default_value = "kube-node")]
+    pub name: String,
+
+    /// Node role
+    #[arg(long, default_value = "server", value_parser = clap::builder::PossibleValuesParser::new(["server", "agent"]))]
+    pub role: String,
+
+    /// Cluster shared token (auto-generated if omitted)
+    #[arg(long)]
+    pub token: Option<String>,
+
+    /// Control-plane endpoint IP (required for agents)
+    #[arg(long)]
+    pub server_ip: Option<String>,
+
+    /// Static IP in CIDR notation (e.g., 192.168.1.100/24)
+    #[arg(long)]
+    pub ip: Option<String>,
+
+    /// Gateway IP
+    #[arg(long)]
+    pub gateway: Option<String>,
+
+    /// DNS server IP
+    #[arg(long)]
+    pub dns: Option<String>,
+
+    /// UUID for the kube-state partition
+    #[arg(long, default_value = "deadbeef-1234-5678-9abc-def012345678")]
+    pub kube_uuid: String,
+
+    /// Skip interactive confirmation
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+}
+
+#[derive(clap::Args, Clone)]
+pub struct FlashArgs {
+    /// Target block device
+    #[arg(long)]
+    pub drive: String,
+
+    /// Path to the baked .img file
+    #[arg(long)]
+    pub image: String,
+
+    /// Skip interactive confirmation
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+}
+
+impl Cli {
+    pub fn run(self) -> Result<()> {
+        match self.command {
+            Commands::Bake(args) => cmd_bake(args),
+            Commands::Bootstrap(args) => cmd_bootstrap(args),
+            Commands::Flash(args) => cmd_flash(args),
+        }
+    }
+}
+
+fn cmd_bake(args: BakeArgs) -> Result<()> {
+    println!("{}", ">>> Baking immutable Debian K3s image...".bold().cyan());
+    println!("    arch:       {}", args.arch);
+    println!("    kube-uuid:  {}", args.kube_uuid);
+    println!("    output-dir: {}", args.output_dir);
+    println!();
+
+    let packer = PackerManager::new()?;
+    packer
+        .build_image(&args)
+        .context("Packer image build failed")?;
+
+    println!();
+    println!(
+        "{}",
+        "✔ Image baked successfully!".bold().green()
+    );
+    Ok(())
+}
+
+fn cmd_bootstrap(args: BootstrapArgs) -> Result<()> {
+    let docker = DockerClient::new()?;
+
+    let drive = match &args.drive {
+        Some(d) => d.clone(),
+        None => {
+            println!(
+                "{}",
+                ">>> No --drive specified. Scanning for available disks...".bold().yellow()
+            );
+            let disks = docker.list_disks().context("Failed to list disks")?;
+            if disks.is_empty() {
+                anyhow::bail!("No block devices found. Insert a drive and retry.");
+            }
+            select_disk_interactive(&disks)?
+        }
+    };
+
+    let token = args.token.clone().unwrap_or_else(|| {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        hex::encode((0..16).map(|_| rng.gen::<u8>()).collect::<Vec<_>>())
+    });
+
+    println!("{}", "\n>>> Bootstrap Configuration:".bold().cyan());
+    println!("    drive:      {}", drive);
+    println!("    name:       {}", args.name);
+    println!("    role:       {}", args.role);
+    println!("    token:      {}", token);
+    if let Some(ref sip) = args.server_ip {
+        println!("    server-ip:  {}", sip);
+    }
+    if let Some(ref ip) = args.ip {
+        println!("    ip:         {}", ip);
+    }
+    if let Some(ref gw) = args.gateway {
+        println!("    gateway:    {}", gw);
+    }
+    if let Some(ref dns) = args.dns {
+        println!("    dns:        {}", dns);
+    }
+    println!("    kube-uuid:  {}", args.kube_uuid);
+    println!();
+
+    if !args.yes {
+        confirm_destructive_action(&drive)?;
+    }
+
+    docker
+        .bootstrap_drive(
+            &drive,
+            &args.name,
+            &args.role,
+            &token,
+            args.server_ip.as_deref(),
+            args.ip.as_deref(),
+            args.gateway.as_deref(),
+            args.dns.as_deref(),
+            &args.kube_uuid,
+        )
+        .context("Drive bootstrap failed")?;
+
+    println!();
+    println!(
+        "{}",
+        format!("✔ Drive {} bootstrapped successfully!", drive)
+            .bold()
+            .green()
+    );
+    Ok(())
+}
+
+fn cmd_flash(args: FlashArgs) -> Result<()> {
+    let docker = DockerClient::new()?;
+
+    println!("{}", ">>> Flashing OS to drive...".bold().cyan());
+    println!("    drive: {}", args.drive);
+    println!("    image: {}", args.image);
+    println!();
+
+    if !args.yes {
+        confirm_destructive_action(&args.drive)?;
+    }
+
+    docker
+        .flash_drive(&args.drive, &args.image)
+        .context("Drive flash failed")?;
+
+    println!();
+    println!(
+        "{}",
+        format!("✔ Drive {} flashed successfully!", args.drive)
+            .bold()
+            .green()
+    );
+    Ok(())
+}
+
+fn select_disk_interactive(disks: &[String]) -> Result<String> {
+    use dialoguer::{Select, theme::ColorfulTheme};
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select target disk")
+        .items(disks)
+        .default(0)
+        .interact()
+        .context("Disk selection cancelled")?;
+    Ok(disks[selection].clone())
+}
+
+fn confirm_destructive_action(drive: &str) -> Result<()> {
+    use dialoguer::Confirm;
+    let confirmed = Confirm::new()
+        .with_prompt(format!(
+            "{}",
+            format!(
+                "WARNING: This will DESTROY ALL DATA on {}. Are you absolutely sure?",
+                drive
+            )
+            .red()
+            .bold()
+        ))
+        .default(false)
+        .interact()
+        .context("Confirmation prompt failed")?;
+    if !confirmed {
+        anyhow::bail!("Aborted by user.");
+    }
+    Ok(())
+}
