@@ -81,6 +81,7 @@ impl PackerManager {
         let status = Command::new("nix")
             .args([
                 "build",
+                "--no-sandbox",
                 "--out-link",
                 &output_dir.join("result").to_string_lossy(),
                 &format!("{}#rawImage", flake_dir),
@@ -129,7 +130,7 @@ impl PackerManager {
 cd /host-project
 # Ensure Nix files are Git-tracked (required by Nix in a Git repo)
 git add flake.nix nix/ 2>/dev/null || true
-nix build --out-link /host-output/result .#rawImage
+nix build --no-sandbox --out-link /host-output/result .#rawImage
 if [ -f /host-output/result/disk.raw ]; then
   cp /host-output/result/disk.raw /host-output/stateless-debian-kube.img
   rm -r /host-output/result
