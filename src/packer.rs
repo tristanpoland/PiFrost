@@ -245,7 +245,14 @@ fn locate_template() -> Result<PathBuf> {
     ];
     for c in &candidates {
         if Path::new(c).exists() {
-            return Ok(Path::new(c).canonicalize()?);
+            let abs = if Path::new(c).is_absolute() {
+                Path::new(c).to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .context("Failed to get current directory")?
+                    .join(c)
+            };
+            return Ok(abs);
         }
     }
     // Search relative to the executable
