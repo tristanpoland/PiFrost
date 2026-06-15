@@ -139,19 +139,15 @@ echo "=== Building nixos-install-tools ==="
 nix build --no-sandbox --out-link /host-output/install-tools \
   nixpkgs#nixos-install-tools
 
-echo "=== Building disk utilities ==="
-mkdir -p /host-output/tools/bin
-for pkg in parted e2fsprogs dosfstools utillinux rsync gnused; do
-  nix build --no-sandbox --out-link "/host-output/tools/$pkg" "nixpkgs#$pkg" 2>&1
-  if [ -d "/host-output/tools/$pkg/bin" ]; then
-    cp -r "/host-output/tools/$pkg/bin/"* /host-output/tools/bin/ 2>/dev/null || true
-  fi
-done
-export PATH="/host-output/tools/bin:$PATH"
+echo "=== Writing assembly script ==="
+cat > /tmp/assemble.sh << 'ASM'
+#!/bin/sh
+set -eux
 
-echo "=== Creating raw disk image ==="
 DISK_IMAGE=/host-output/stateless-debian-kube.img
 rm -f "$DISK_IMAGE"
+
+echo "=== Creating raw disk image ==="
 dd if=/dev/zero of="$DISK_IMAGE" bs=1M count=5000 status=progress
 
 echo "=== Partitioning ==="
@@ -182,19 +178,15 @@ echo "=== Installing NixOS to image ==="
 CLOSURE=$(readlink /host-output/closure)
 INSTALL_TOOLS=$(readlink /host-output/install-tools)
 
-# nixos-install copies the closure, runs activation, sets up bootloader
 "$INSTALL_TOOLS/bin/nixos-install" \
   --root /mnt/root \
   --system "$CLOSURE" \
-  --no-root-password \
-  --no-bootloader 2>&1
+  --no-root-passwd \
+  --no-bootloader 2>&1 || echo "WARNING: nixos-install had issues (continuing)"
 
-if [ $? -ne 0 ]; then
-  echo "WARNING: nixos-install had issues (continuing)"
-fi
+CLOSURE_NAME=$(basename "$CLOSURE")
 
-echo "=== Installing systemd-boot manually ==="
-# Find systemd-boot in the closure
+echo "=== Installing systemd-boot ==="
 SYSTEMD_BOOT=$(find "$CLOSURE" -name "systemd-boot*.efi" -type f | head -1)
 if [ -n "$SYSTEMD_BOOT" ]; then
   BOOTNAME=$(basename "$SYSTEMD_BOOT" | sed 's/systemd-boot/BOOT/')
@@ -202,23 +194,15 @@ if [ -n "$SYSTEMD_BOOT" ]; then
   cp "$SYSTEMD_BOOT" /mnt/root/boot/EFI/systemd/
   cp "$SYSTEMD_BOOT" "/mnt/root/boot/EFI/BOOT/$BOOTNAME"
 
-  # Generate loader config
   mkdir -p /mnt/root/boot/loader/entries
-  cat > /mnt/root/boot/loader/loader.conf << 'LOADER'
-default nixos
-timeout 5
-console-mode max
-editor no
-LOADER
-
-  CLOSURE_NAME=$(basename "$CLOSURE")
-  cat > /mnt/root/boot/loader/entries/nixos.conf << 'ENTRY'
-title NixOS
-linux /nix/store/CLOSURE_NAME/kernel
-initrd /nix/store/CLOSURE_NAME/initrd
-options init=/nix/store/CLOSURE_NAME/init loglevel=4
-ENTRY
-  sed -i "s|CLOSURE_NAME|$CLOSURE_NAME|g" /mnt/root/boot/loader/entries/nixos.conf
+  echo 'default nixos'                                 > /mnt/root/boot/loader/loader.conf
+  echo 'timeout 5'                                     >> /mnt/root/boot/loader/loader.conf
+  echo 'console-mode max'                              >> /mnt/root/boot/loader/loader.conf
+  echo 'editor no'                                     >> /mnt/root/boot/loader/loader.conf
+  echo 'title NixOS'                                   > /mnt/root/boot/loader/entries/nixos.conf
+  echo "linux /nix/store/$CLOSURE_NAME/kernel"         >> /mnt/root/boot/loader/entries/nixos.conf
+  echo "initrd /nix/store/$CLOSURE_NAME/initrd"        >> /mnt/root/boot/loader/entries/nixos.conf
+  echo "options init=/nix/store/$CLOSURE_NAME/init loglevel=4" >> /mnt/root/boot/loader/entries/nixos.conf
 fi
 
 echo "=== Cleaning up ==="
@@ -228,9 +212,14 @@ umount /mnt/root 2>/dev/null || true
 kpartx -dv "$LOOP" 2>/dev/null || true
 losetup -d "$LOOP" 2>/dev/null || true
 
-cp "$DISK_IMAGE" /host-output/stateless-debian-kube.img.final
-mv /host-output/stateless-debian-kube.img.final /host-output/stateless-debian-kube.img
 echo "=== Image built successfully ==="
+ASM
+
+echo "=== Running assembly with nix shell ==="
+nix shell --no-sandbox \
+  nixpkgs#parted nixpkgs#e2fsprogs nixpkgs#dosfstools \
+  nixpkgs#utillinux nixpkgs#gnused nixpkgs#kpartx \
+  --command sh /tmp/assemble.sh
 "#;
 
         let status = Command::new("docker")
