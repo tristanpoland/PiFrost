@@ -130,7 +130,8 @@ impl PackerManager {
 cd /host-project
 # Ensure Nix files are Git-tracked (required by Nix in a Git repo)
 git add flake.nix nix/ 2>/dev/null || true
-nix build --no-sandbox --out-link /host-output/result .#rawImage
+nix build --no-sandbox -L --show-trace --out-link /host-output/result .#rawImage \
+  || { echo "=== BUILD FAILED ==="; nix log /nix/store/*-nixos-disk-image.drv 2>/dev/null || true; exit 1; }
 if [ -f /host-output/result/disk.raw ]; then
   cp /host-output/result/disk.raw /host-output/stateless-debian-kube.img
   rm -r /host-output/result
