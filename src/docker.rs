@@ -208,10 +208,10 @@ else
 fi
 
 echo ">>> Formatting boot partition (FAT32)"
-mkfs.vfat -F 32 -n "system-boot" "$PART1"
+mkfs.vfat -F 32 -n "ESP" "$PART1"
 
 echo ">>> Formatting OS partition (EXT4)"
-mkfs.ext4 -F -L "writable" "$PART2"
+mkfs.ext4 -F -L "nixos" "$PART2"
 
 echo ">>> Formatting kube-state partition (EXT4, UUID=$KUBE_UUID)"
 mkfs.ext4 -F -L "kube-state" -U "$KUBE_UUID" "$PART3"

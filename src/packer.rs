@@ -2,293 +2,197 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use crate::cli::BakeArgs;
 
 pub struct PackerManager {
-    packer_bin: String,
     use_docker: bool,
 }
 
 impl PackerManager {
     pub fn new() -> Result<Self> {
-        if let Some(bin) = Self::find_local_packer() {
-            info!("Packer detected at {}", bin);
-            return Ok(Self {
-                packer_bin: bin,
-                use_docker: false,
-            });
+        if Self::check_nix() {
+            info!("Nix detected on host");
+            return Ok(PackerManager { use_docker: false });
         }
-        warn!("Packer not found in PATH or current dir — will use Dockerized Packer");
-        Self::check_docker_for_packer()?;
-        Ok(Self {
-            packer_bin: String::new(),
-            use_docker: true,
-        })
+
+        info!("Nix not found on host — checking Docker for nixos/nix image");
+        Self::check_docker().context(
+            "Nix is not installed and Docker is not available.\n\
+             Install Nix: https://nixos.org/download.html\n\
+             Or install Docker Desktop for Nix-in-Docker fallback.",
+        )?;
+        Ok(PackerManager { use_docker: true })
     }
 
-    fn find_local_packer() -> Option<String> {
-        // Check PATH first
-        if Command::new("packer")
+    fn check_nix() -> bool {
+        Command::new("nix")
             .arg("--version")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
-        {
-            return Some("packer".into());
-        }
-        // Check current directory for a packer binary
-        let local = std::env::current_dir().ok()?.join("packer");
-        if local.exists() {
-            Command::new(&local)
-                .arg("--version")
-                .output()
-                .ok()
-                .filter(|o| o.status.success())?;
-            return Some(local.to_string_lossy().to_string());
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let local_exe = std::env::current_dir().ok()?.join("packer.exe");
-            if local_exe.exists() {
-                Command::new(&local_exe)
-                    .arg("--version")
-                    .output()
-                    .ok()
-                    .filter(|o| o.status.success())?;
-                return Some(local_exe.to_string_lossy().to_string());
-            }
-        }
-        None
     }
 
-    fn check_docker_for_packer() -> Result<()> {
-        let output = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "hashicorp/packer:latest",
-                "--version",
-            ])
+    fn check_docker() -> Result<()> {
+        Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
             .output()
-            .context("Failed to run Packer via Docker. Is Docker running?")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "Packer is not available locally or via Docker: {}",
-                stderr.trim()
-            );
-        }
-        info!(
-            "Dockerized Packer available (v{})",
-            String::from_utf8_lossy(&output.stdout).trim()
-        );
-        Ok(())
+            .context("Docker daemon not accessible")?
+            .status
+            .success()
+            .then_some(())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Docker daemon is not running")
+            })
     }
 
-    /// Build the OS image using the Packer template.
     pub fn build_image(&self, args: &BakeArgs) -> Result<PathBuf> {
         let output_dir = Path::new(&args.output_dir);
-        if !output_dir.exists() {
-            std::fs::create_dir_all(output_dir)
-                .context("Failed to create output directory")?;
-        }
 
-        let output_file = output_dir.join("stateless-debian-kube.img");
-        if output_file.exists() && !args.force {
+        let final_file = output_dir.join("stateless-debian-kube.img");
+        if final_file.exists() && !args.force {
             info!(
                 "Output image already exists at {} (use --force to rebuild)",
-                output_file.display()
+                final_file.display()
             );
-            return Ok(output_file);
+            return Ok(final_file);
         }
-
-        let template_path = locate_template()?;
-        let template_dir = template_path
-            .parent()
-            .context("Failed to get template directory")?;
-
-        let var_file = prepare_vars(args)?;
 
         if self.use_docker {
-            self.build_via_docker(
-                template_dir,
-                &var_file,
-                output_dir,
-                &args.arch,
-            )?;
+            self.build_via_docker(args, &final_file)
         } else {
-            self.build_locally(
-                template_dir,
-                &var_file,
-                output_dir,
-                &args.arch,
-            )?;
+            self.build_locally(args, &final_file)
+        }
+    }
+
+    fn build_locally(&self, _args: &BakeArgs, final_file: &Path) -> Result<PathBuf> {
+        let flake_dir = resolve_flake_dir()?;
+        let output_dir = final_file.parent().unwrap_or(Path::new("."));
+
+        if output_dir.exists() {
+            std::fs::remove_dir_all(output_dir)
+                .context("Failed to remove existing output directory")?;
+        }
+        std::fs::create_dir_all(output_dir)
+            .context("Failed to create output directory")?;
+
+        info!("Building NixOS raw image...");
+        let status = Command::new("nix")
+            .args([
+                "build",
+                "--out-link",
+                &output_dir.join("result").to_string_lossy(),
+                &format!("{}#rawImage", flake_dir),
+            ])
+            .status()
+            .context("Failed to execute nix build")?;
+
+        if !status.success() {
+            bail!("nix build failed with exit code: {:?}", status.code());
         }
 
-        if !output_file.exists() {
-            bail!(
-                "Build completed but output file not found at {}",
-                output_file.display()
-            );
+        let built = output_dir.join("result").join("disk.raw");
+        if !built.exists() {
+            bail!("Nix build completed but disk.raw not found");
         }
 
-        let metadata = std::fs::metadata(&output_file)?;
+        std::fs::copy(&built, final_file)
+            .context("Failed to copy raw image")?;
+        let _ = std::fs::remove_dir_all(output_dir.join("result"));
+
         info!(
             "Image built: {} ({})",
-            output_file.display(),
-            humansize(metadata.len())
+            final_file.display(),
+            humansize(std::fs::metadata(final_file)?.len())
         );
-
-        Ok(output_file)
+        Ok(final_file.to_path_buf())
     }
 
-    fn build_locally(
-        &self,
-        template_dir: &Path,
-        var_file: &Path,
-        output_dir: &Path,
-        arch: &str,
-    ) -> Result<()> {
-        let abs_template_dir = resolve_abs_path(template_dir)?;
-        let abs_var_file = resolve_abs_path(var_file)?;
-        let abs_output = resolve_abs_path(output_dir)?;
+    fn build_via_docker(&self, _args: &BakeArgs, final_file: &Path) -> Result<PathBuf> {
+        let output_dir = final_file.parent().unwrap_or(Path::new("."));
+        let host_project = resolve_host_path(".")?;
+        let host_output = resolve_host_path(
+            &output_dir.to_string_lossy(),
+        )?;
 
-        info!("Running Packer build locally...");
-        let status = Command::new(&self.packer_bin)
-            .args([
-                "build",
-                "-var-file",
-                &abs_var_file,
-                "-var",
-                &format!("output_dir={}", abs_output),
-                "-var",
-                &format!("arch={}", arch),
-                &format!("{}/debian-node.pkr.hcl", abs_template_dir),
-            ])
-            .status()
-            .context("Failed to execute packer build")?;
-
-        if !status.success() {
-            bail!("Packer build failed with exit code: {:?}", status.code());
+        if output_dir.exists() {
+            std::fs::remove_dir_all(output_dir)
+                .context("Failed to remove existing output directory")?;
         }
-        Ok(())
-    }
+        std::fs::create_dir_all(output_dir)
+            .context("Failed to create output directory")?;
 
-    fn build_via_docker(
-        &self,
-        template_dir: &Path,
-        var_file: &Path,
-        output_dir: &Path,
-        arch: &str,
-    ) -> Result<()> {
-        let abs_template_dir = resolve_abs_path(template_dir)?;
-        let abs_var_file = resolve_abs_path(var_file)?;
-        let abs_output = resolve_abs_path(output_dir)?;
+        info!("Building NixOS raw image via Docker (nixos/nix)...");
 
-        let host_template = host_path_for_docker(&abs_template_dir)?;
-        let host_var = host_path_for_docker(&abs_var_file)?;
-        let host_output = host_path_for_docker(&abs_output)?;
+        let script = r#"set -eux
+cd /host-project
+# Ensure Nix files are Git-tracked (required by Nix in a Git repo)
+git add flake.nix nix/ 2>/dev/null || true
+nix build --out-link /host-output/result .#rawImage
+if [ -f /host-output/result/disk.raw ]; then
+  cp /host-output/result/disk.raw /host-output/stateless-debian-kube.img
+  rm -r /host-output/result
+fi
+"#;
 
-        info!("Running Packer build via Docker...");
         let status = Command::new("docker")
             .args([
-                "run",
-                "--rm",
-                "--privileged",
-                "-v",
-                &format!("{}:/templates", host_template),
-                "-v",
-                &format!("{}:/output", host_output),
-                "-v",
-                &format!("{}:/vars.pkr.hcl", host_var),
-                "-e",
-                "PACKER_PLUGIN_DIR=/tmp/plugins",
-                "hashicorp/packer:latest",
-                "build",
-                "-var-file=/vars.pkr.hcl",
-                "-var",
-                &format!("output_dir=/output"),
-                "-var",
-                &format!("arch={}", arch),
-                "/templates/debian-node.pkr.hcl",
+                "run", "--rm", "--privileged",
+                "-v", &format!("{}:/host-project", host_project),
+                "-v", &format!("{}:/host-output", host_output),
+                "-e", "NIX_CONFIG=experimental-features = nix-command flakes",
+                "nixos/nix",
+                "/bin/sh", "-c", &script,
             ])
             .status()
-            .context("Failed to execute Packer build via Docker")?;
+            .context("Failed to run Nix build in Docker")?;
 
         if !status.success() {
-            bail!(
-                "Dockerized Packer build failed with exit code: {:?}",
-                status.code()
-            );
+            bail!("Nix build via Docker failed with exit code: {:?}", status.code());
         }
-        Ok(())
+
+        if !final_file.exists() {
+            bail!("Docker build completed but output not found");
+        }
+
+        info!(
+            "Image built: {} ({})",
+            final_file.display(),
+            humansize(std::fs::metadata(final_file)?.len())
+        );
+        Ok(final_file.to_path_buf())
     }
 }
 
-fn resolve_abs_path(path: &Path) -> Result<String> {
-    if path.is_absolute() {
-        Ok(path.to_string_lossy().replace('\\', "/"))
-    } else {
-        let cwd = std::env::current_dir()
-            .context("Failed to get current working directory")?;
-        Ok(cwd.join(path).to_string_lossy().replace('\\', "/"))
+fn resolve_flake_dir() -> Result<String> {
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+    let flake = cwd.join("flake.nix");
+    if flake.exists() {
+        return Ok(cwd.to_string_lossy().replace('\\', "/"));
     }
-}
-
-fn locate_template() -> Result<PathBuf> {
-    let candidates = [
-        "templates/debian-node.pkr.hcl",
-        "../templates/debian-node.pkr.hcl",
-    ];
-    for c in &candidates {
-        if Path::new(c).exists() {
-            let abs = if Path::new(c).is_absolute() {
-                Path::new(c).to_path_buf()
-            } else {
-                std::env::current_dir()
-                    .context("Failed to get current directory")?
-                    .join(c)
-            };
-            return Ok(abs);
-        }
-    }
-    // Search relative to the executable
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("templates/debian-node.pkr.hcl");
-            if p.exists() {
-                return Ok(p);
+            if dir.join("flake.nix").exists() {
+                return Ok(dir.to_string_lossy().replace('\\', "/"));
             }
         }
     }
-    bail!(
-        "Cannot locate template file 'templates/debian-node.pkr.hcl'. \
-         Ensure the templates/ directory is present in the project root."
-    );
+    bail!("Cannot locate flake.nix in current directory or executable directory");
 }
 
-fn prepare_vars(args: &BakeArgs) -> Result<PathBuf> {
-    let var_content = format!(
-        r#"kube_uuid = "{}"
-arch = "{}"
-output_dir = "{}"
-"#,
-        args.kube_uuid, args.arch, args.output_dir
-    );
-
-    let var_path = Path::new(&args.output_dir).join("build.vars.pkr.hcl");
-    std::fs::write(&var_path, &var_content)
-        .context("Failed to write Packer variable file")?;
-    Ok(var_path)
-}
-
-fn host_path_for_docker(path: &str) -> Result<String> {
-    let raw = path.replace('\\', "/");
-    debug!("Docker host path: {}", raw);
-    Ok(raw)
+fn resolve_host_path(path: &str) -> Result<String> {
+    let p = Path::new(path);
+    if p.exists() {
+        if p.is_absolute() {
+            Ok(p.to_string_lossy().replace('\\', "/"))
+        } else {
+            let cwd = std::env::current_dir().context("Failed to get cwd")?;
+            Ok(cwd.join(p).to_string_lossy().replace('\\', "/"))
+        }
+    } else {
+        Ok(path.replace('\\', "/"))
+    }
 }
 
 fn humansize(bytes: u64) -> String {

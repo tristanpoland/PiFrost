@@ -1,8 +1,10 @@
 /target/
 /output/
+/result
 *.img
 *.img.gz
 *.iso
+*.vdi
 build.vars.pkr.hcl
 .DS_Store
 Thumbs.db

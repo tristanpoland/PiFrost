@@ -1,63 +1,61 @@
-# pifrost — Immutable K3s Node Provisioner
+# pifrost — Immutable NixOS K3s Node Provisioner
 
-**pifrost** bakes stateless Debian 12 (Bookworm) Kubernetes node images with
-HashiCorp Packer, partitions bare-metal media (SD cards, NVMe, USB drives) via
-Docker isolation, and seeds fully automated, zero-touch K3s nodes.
+**pifrost** bakes immutable NixOS raw disk images via `nix build`, partitions
+bare-metal media (SD cards, NVMe, USB drives) inside a privileged Docker
+container, and seeds zero-touch K3s nodes with automatic role detection.
+
+All low-level disk operations (`parted`, `mkfs`, `dd`, `kpartx`) run inside an
+ephemeral `pifrost-worker` Docker container so the tool works identically on
+**Windows, macOS, and Linux** with no native partitioning tools required.
 
 ## How it works
 
 ```
 ┌──────────┐     ┌──────────────┐     ┌──────────────────────┐
-│ pifrost  │────▶│  Docker CLI  │────▶│  Worker Container    │
-│ bake     │     │  (privileged)│     │  parted / mkfs / dd  │
+│ pifrost  │────▶│  nix build   │────▶│  NixOS raw disk img  │
+│ bake     │     │  (or Docker) │     │  (p1:FAT32 p2:EXT4)  │
 └──────────┘     └──────────────┘     └──────────────────────┘
-                                                     │
-                     ┌──────────────┐                │
-                     │  Packer      │◀───────────────┘
-                     │  QEMU build  │  (or local packer)
-                     └──────────────┘
-```
 
-All low-level disk operations run inside an ephemeral Docker container so
-pifrost works identically on **Windows, macOS, and Linux** with no native
-partitioning tools required.
+┌──────────┐     ┌──────────────┐     ┌──────────────────────┐
+│ pifrost  │────▶│  Docker CLI  │────▶│  Worker Container    │
+│ bootstrap│     │  (privileged)│     │  parted / mkfs / dd  │
+└──────────┘     └──────────────┘     └──────────────────────┘
+
+┌──────────┐     ┌──────────────┐     ┌──────────────────────┐
+│ pifrost  │────▶│  kpartx + dd │────▶│  p1+p2 only, p3 kept │
+│ flash    │     │  (loopback)  │     │  preserves kube-state│
+└──────────┘     └──────────────┘     └──────────────────────┘
+```
 
 ## Architecture
 
-Each bootable drive gets a three-partition layout:
+Each bootable drive has a three-partition GPT layout:
 
 | # | Label | Size | Format | Content |
 |---|-------|------|--------|---------|
-| 1 | `system-boot` | 512 MB | FAT32 | GRUB + kernel |
-| 2 | `writable` | 4 GB | EXT4 | Immutable OS (overlayroot) |
+| 1 | `ESP` | 512 MB | FAT32 | systemd-boot + kernel |
+| 2 | `nixos` | 4 GB | EXT4 | NixOS store + root |
 | 3 | `kube-state` | Remainder | EXT4 | Persistent K3s data |
 
-**The OS is read-only at runtime.** Overlayroot places root on a volatile tmpfs
-ramdisk. Only `/mnt/kube-state` (the third partition) persists across reboots,
-holding K3s state, containerd data, machine identity, and cluster config.
+**The OS root is ephemeral.** NixOS impermanence mounts a tmpfs root; only
+`/mnt/kube-state` (partition 3) persists across reboots, holding K3s state,
+containerd data, machine identity, and cluster configuration. Symlinks redirect
+`/var/lib/rancher/k3s`, `/var/lib/containerd`, and `/etc/rancher/k3s` into the
+persistent partition.
 
 During early boot, the `kube-identity` systemd service:
 1. Mounts the kube-state partition read-only
-2. Bind-mounts `machine-id` from the seeded partition
-3. Reads `node-mode.env` to decide server vs. agent role
-4. Enables the correct K3s service
+2. Bind-mounts the seeded `machine-id`
+3. Reads `node-mode.env` → decides server or agent role
+4. Enables the correct K3s systemd service
 5. Stages any pre-seeded network configuration
 
 ## Prerequisites
 
-- **Rust toolchain** (edition 2021, MSRV 1.79+)
-- **Docker** (Desktop or Engine) — mandatory for all operations
-- **Packer** (optional) — if missing, pifrost auto-detects `packer` on `PATH`,
-  then checks `./packer` in the current directory, then falls back to
-  `hashicorp/packer:latest` via Docker
-
-```bash
-# Verify Docker
-docker info
-
-# (Optional) Install Packer locally
-# https://developer.hashicorp.com/packer/downloads
-```
+- **Rust toolchain** (edition 2021)
+- **Docker** (Desktop or Engine) — required for `bootstrap` and `flash`
+- **Nix package manager** (optional) — if missing, `bake` falls back to
+  `nixos/nix` via Docker
 
 ## Install
 
@@ -69,27 +67,27 @@ cargo build --release
 
 ## Usage
 
-### 1. Bake — Build the OS image
+### 1. Bake — Build the NixOS raw disk image
 
 ```bash
-pifrost bake --arch amd64 --output-dir ./output
+pifrost bake --output-dir ./output
 ```
 
-This generates `./output/stateless-debian-kube.img` — a raw disk image
-containing the full Debian 12 installation with:
+This generates `./output/stateless-debian-kube.img` by running `nix build .#rawImage`
+(either with a local Nix installation or inside `nixos/nix` Docker container).
+The image contains a minimal NixOS installation with:
 
-- overlayroot (read-only root on tmpfs)
-- K3s binaries pre-cached (both server and agent)
-- Symlinks from `/var/lib/rancher/k3s` → `/mnt/kube-state/k3s`
-- kube-identity early-boot systemd service
-- Kernel cgroup flags for Kubernetes
-- Correct sysctl settings (net.bridge-nf-call-iptables, etc.)
+- systemd-boot on EFI System Partition
+- Impermanence (ephemeral root, data flows to kube-state)
+- K3s binaries cached (server + agent), neither enabled by default
+- `kube-identity` early-boot systemd service
+- Kernel cgroup flags and sysctl settings for Kubernetes
+- Symlinks: K3s runtime directories → `/mnt/kube-state/`
 
 Options:
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--arch` | `amd64` | `amd64` or `arm64` |
-| `--kube-uuid` | `deadbeef-...` | UUID for kube-state partition |
+| `--arch` | `x86_64-linux` | NixOS platform string |
 | `--output-dir` | `./output` | Output directory |
 | `--force` | false | Rebuild even if output exists |
 
@@ -106,17 +104,16 @@ pifrost bootstrap \
   --drive /dev/sdc \
   --name k8s-control-1 \
   --role server \
-  --token my-cluster-token \
-  --kube-uuid deadbeef-1234-5678-9abc-def012345678
+  --token my-cluster-token
 ```
 
 The command:
-1. Wipes the partition table and creates GPT layout
-2. Formats all three partitions (FAT32, EXT4, EXT4 with your UUID)
+1. Wipes the partition table and creates GPT layout (p1 FAT32 512 MB, p2 EXT4 4 GB, p3 EXT4 remainder)
+2. Formats all three partitions with correct labels (`ESP`, `nixos`, `kube-state`)
 3. Generates a random 32-char hex `machine-id`
 4. Seeds `node-mode.env` for auto role detection
-5. Writes `config.yaml` to `/etc/k3s/` for K3s
-6. Creates empty `k3s/`, `containerd/`, `etc/k3s/` directories
+5. Writes `config.yaml` for K3s configuration
+6. Creates empty `k3s/`, `containerd/`, `etc/k3s/` directories on kube-state
 
 **Agent example:**
 ```bash
@@ -140,30 +137,30 @@ pifrost bootstrap \
   --dns 192.168.1.1
 ```
 
-### 3. Flash — Update OS while preserving K3s data
+### 3. Flash — Update OS while preserving K3s state
 
-When you have a new image but want to keep the kube-state partition intact:
+When you have a new image but want to keep the kube-state partition:
 
 ```bash
 pifrost flash --drive /dev/sdc --image ./output/stateless-debian-kube.img
 ```
 
-This mounts the image via loopback, then **only writes partitions 1 and 2** to
-the target drive. Partition 3 (kube-state) is left untouched — your cluster
+This attaches the image via loopback (`kpartx`), then **only writes partitions
+1 and 2** to the target drive. Partition 3 (kube-state) is untouched — cluster
 identity, K3s state, and containerd data survive the upgrade.
 
 ## What happens on first boot
 
-1. UEFI/BIOS boots from partition 1 (GRUB)
-2. Kernel loads from partition 2 with `cgroup_enable=cpuset cgroup_enable=memory`
+1. UEFI boots from partition 1 (systemd-boot)
+2. Kernel loads with `cgroup_enable=cpuset cgroup_enable=memory`
 3. `kube-identity.service` runs **before** `local-fs-pre.target`:
    - Mounts partition 3 read-only at `/mnt/kube-state`
-   - Reads `machine-id` → bind-mounts over `/etc/machine-id`
-   - Reads `node-mode.env` → enables `k3s-server.service` or `k3s-agent.service`
+   - Copies `machine-id` → bind-mounts over `/etc/machine-id`
+   - Reads `node-mode.env` → enables `k3s.service` or `k3s-agent.service`
    - Stages network configs from `/mnt/kube-state/etc/network/`
-4. Overlayroot takes effect — root becomes read-only tmpfs
+4. Impermanence takes effect — root is a tmpfs snapshot
 5. K3s starts with config from `/mnt/kube-state/etc/k3s/config.yaml`
-6. All runtime state flows to `/mnt/kube-state/k3s` and `/mnt/kube-state/containerd`
+6. All runtime data flows through symlinks to `/mnt/kube-state/`
 
 ## File layout on kube-state partition
 
@@ -178,26 +175,25 @@ identity, K3s state, and containerd data survive the upgrade.
         └── config.yaml     # K3s cluster config
 ```
 
-## How pifrost finds Packer
+## How pifrost finds Nix
 
-Priority order:
-1. **`packer` on `PATH`** — globally installed
-2. **`./packer` (or `./packer.exe`)** — local binary shipped with project
-3. **`hashicorp/packer:latest`** — Docker image (auto-pulled)
+Priority order for `bake`:
+1. **`nix` on `PATH`** — runs `nix build .#rawImage` locally
+2. **`nixos/nix` Docker image** — auto-pulled if Nix is absent (always the case
+   on Windows)
 
 ## Safety
 
-- Every destructive operation requires an explicit typed confirmation
+- Every destructive operation requires explicit typed confirmation
 - The `flash` command never touches partition 3
-- Docker verification happens at startup — pifrost refuses to run without it
-- All subprocess stderr/stdout is captured and reported on failure
+- Docker daemon verification at startup
+- All subprocess stdout/stderr captured and reported on failure
 
 ## Development
 
 ```bash
-cargo check      # Verify compilation
-cargo build      # Debug build
-cargo build --release  # Release build
+cargo check
+cargo build --release
 ```
 
 ## License

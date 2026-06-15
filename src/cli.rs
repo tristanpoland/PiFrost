@@ -10,8 +10,8 @@ use crate::packer::PackerManager;
     name = "pifrost",
     about = "Immutable K3s node image baker & bare-metal provisioner",
     version,
-    long_about = "pifrost bakes immutable Debian 12 images with Packer, partitions \
-    bare-metal media via Docker isolation, and seeds automated Kubernetes nodes."
+    long_about = "pifrost builds NixOS raw disk images with nix build, partitions \
+    bare-metal media via Docker isolation, and seeds automated K3s nodes."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -20,7 +20,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Bake a stateless Debian K3s image using Packer
+    /// Build a NixOS raw disk image using nix build
     Bake(BakeArgs),
     /// Wipe, partition, and pre-seed a drive for zero-touch autoinstall
     Bootstrap(BootstrapArgs),
@@ -30,13 +30,9 @@ enum Commands {
 
 #[derive(clap::Args, Clone)]
 pub struct BakeArgs {
-    /// Target CPU architecture
-    #[arg(long, default_value = "amd64", value_parser = clap::builder::PossibleValuesParser::new(["amd64", "arm64"]))]
+    /// Target CPU architecture (NixOS config must match)
+    #[arg(long, default_value = "x86_64-linux")]
     pub arch: String,
-
-    /// UUID for the persistent kube-state partition
-    #[arg(long, default_value = "deadbeef-1234-5678-9abc-def012345678")]
-    pub kube_uuid: String,
 
     /// Output directory for the baked image
     #[arg(long, default_value = "./output")]
@@ -116,21 +112,19 @@ impl Cli {
 }
 
 fn cmd_bake(args: BakeArgs) -> Result<()> {
-    println!("{}", ">>> Baking immutable Debian K3s image...".bold().cyan());
-    println!("    arch:       {}", args.arch);
-    println!("    kube-uuid:  {}", args.kube_uuid);
+    println!("{}", ">>> Building NixOS raw disk image...".bold().cyan());
     println!("    output-dir: {}", args.output_dir);
     println!();
 
     let packer = PackerManager::new()?;
     packer
         .build_image(&args)
-        .context("Packer image build failed")?;
+        .context("Image build failed")?;
 
     println!();
     println!(
         "{}",
-        "✔ Image baked successfully!".bold().green()
+        "✔ Image built successfully!".bold().green()
     );
     Ok(())
 }
