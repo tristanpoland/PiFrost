@@ -218,7 +218,7 @@ ASM
 echo "=== Running assembly with nix shell ==="
 nix shell --no-sandbox \
   nixpkgs#parted nixpkgs#e2fsprogs nixpkgs#dosfstools \
-  nixpkgs#utillinux nixpkgs#gnused nixpkgs#kpartx \
+  nixpkgs#util-linux nixpkgs#gnused nixpkgs#multipath-tools \
   --command sh /tmp/assemble.sh
 "#;
 
