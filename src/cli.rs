@@ -88,9 +88,9 @@ pub struct BootstrapArgs {
 
 #[derive(clap::Args, Clone)]
 pub struct FlashArgs {
-    /// Target block device
+    /// Target block device. If omitted, lists available disks interactively.
     #[arg(long)]
-    pub drive: String,
+    pub drive: Option<String>,
 
     /// Path to the baked .img file
     #[arg(long)]
@@ -204,23 +204,38 @@ fn cmd_bootstrap(args: BootstrapArgs) -> Result<()> {
 fn cmd_flash(args: FlashArgs) -> Result<()> {
     let docker = DockerClient::new()?;
 
+    let drive = match &args.drive {
+        Some(d) => d.clone(),
+        None => {
+            println!(
+                "{}",
+                ">>> No --drive specified. Scanning for available disks...".bold().yellow()
+            );
+            let disks = docker.list_disks().context("Failed to list disks")?;
+            if disks.is_empty() {
+                anyhow::bail!("No block devices found. Insert a drive and retry.");
+            }
+            select_disk_interactive(&disks)?
+        }
+    };
+
     println!("{}", ">>> Flashing OS to drive...".bold().cyan());
-    println!("    drive: {}", args.drive);
+    println!("    drive: {}", drive);
     println!("    image: {}", args.image);
     println!();
 
     if !args.yes {
-        confirm_destructive_action(&args.drive)?;
+        confirm_destructive_action(&drive)?;
     }
 
     docker
-        .flash_drive(&args.drive, &args.image)
+        .flash_drive(&drive, &args.image)
         .context("Drive flash failed")?;
 
     println!();
     println!(
         "{}",
-        format!("✔ Drive {} flashed successfully!", args.drive)
+        format!("✔ Drive {} flashed successfully!", drive)
             .bold()
             .green()
     );

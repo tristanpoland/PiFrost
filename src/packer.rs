@@ -187,7 +187,7 @@ INSTALL_TOOLS=$(readlink /host-output/install-tools)
 CLOSURE_NAME=$(basename "$CLOSURE")
 
 echo "=== Installing systemd-boot ==="
-SYSTEMD_BOOT=$(find "$CLOSURE" -name "systemd-boot*.efi" -type f | head -1)
+SYSTEMD_BOOT=$(find -L "$CLOSURE" -name "systemd-boot*.efi" -type f 2>/dev/null | head -1)
 if [ -n "$SYSTEMD_BOOT" ]; then
   BOOTNAME=$(basename "$SYSTEMD_BOOT" | sed 's/systemd-boot/BOOT/')
   mkdir -p /mnt/root/boot/EFI/systemd /mnt/root/boot/EFI/BOOT
@@ -220,6 +220,13 @@ nix shell --no-sandbox \
   nixpkgs#parted nixpkgs#e2fsprogs nixpkgs#dosfstools \
   nixpkgs#util-linux nixpkgs#gnused nixpkgs#multipath-tools \
   --command sh /tmp/assemble.sh
+
+echo "=== Verifying output ==="
+if [ ! -f /host-output/stateless-debian-kube.img ]; then
+  echo "ERROR: Output image not created!"
+  exit 1
+fi
+echo "=== Image ready: /host-output/stateless-debian-kube.img ==="
 "#;
 
         let status = Command::new("docker")
@@ -308,7 +315,7 @@ mkdir -p /mnt/root/etc
 echo "NixOS" > /mnt/root/etc/NIXOS
 
 # Install systemd-boot
-SYSTEMD_BOOT=$(find "$CLOSURE" -name "systemd-boot*.efi" -type f | head -1)
+SYSTEMD_BOOT=$(find -L "$CLOSURE" -name "systemd-boot*.efi" -type f 2>/dev/null | head -1)
 if [ -n "$SYSTEMD_BOOT" ]; then
   BOOTNAME=$(basename "$SYSTEMD_BOOT" | sed 's/systemd-boot/BOOT/')
   mkdir -p /mnt/root/boot/EFI/systemd /mnt/root/boot/EFI/BOOT
