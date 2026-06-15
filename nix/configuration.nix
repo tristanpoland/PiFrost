@@ -66,6 +66,7 @@
   environment.persistence."/mnt/kube-state" = {
     hideMounts = false;
     directories = [
+      "/var/lib/nixos"
       "/var/lib/rancher/k3s"
       "/var/lib/containerd"
       "/etc/rancher/k3s"
