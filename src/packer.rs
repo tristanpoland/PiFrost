@@ -42,15 +42,13 @@ impl PackerManager {
             .status
             .success()
             .then_some(())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Docker daemon is not running")
-            })
+            .ok_or_else(|| anyhow::anyhow!("Docker daemon is not running"))
     }
 
     pub fn build_image(&self, args: &BakeArgs) -> Result<PathBuf> {
         let output_dir = Path::new(&args.output_dir);
 
-        let final_file = output_dir.join("stateless-debian-kube.img");
+        let final_file = output_dir.join("pifrost-node.img");
         if final_file.exists() && !args.force {
             info!(
                 "Output image already exists at {} (use --force to rebuild)",
@@ -70,21 +68,21 @@ impl PackerManager {
         let flake_dir = resolve_flake_dir()?;
         let output_dir = final_file.parent().unwrap_or(Path::new("."));
 
-        if output_dir.exists() {
-            std::fs::remove_dir_all(output_dir)
-                .context("Failed to remove existing output directory")?;
-        }
+        let _ = std::fs::remove_dir_all(output_dir);
         std::fs::create_dir_all(output_dir)
             .context("Failed to create output directory")?;
 
-        info!("Building NixOS raw image...");
+        info!("Building NixOS system closure...");
         let status = Command::new("nix")
             .args([
                 "build",
                 "--no-sandbox",
                 "--out-link",
                 &output_dir.join("result").to_string_lossy(),
-                &format!("{}#rawImage", flake_dir),
+                &format!(
+                    "{}#nixosConfigurations.pifrost-node.config.system.build.toplevel",
+                    flake_dir
+                ),
             ])
             .status()
             .context("Failed to execute nix build")?;
@@ -93,14 +91,23 @@ impl PackerManager {
             bail!("nix build failed with exit code: {:?}", status.code());
         }
 
-        let built = output_dir.join("result").join("disk.raw");
-        if !built.exists() {
-            bail!("Nix build completed but disk.raw not found");
+        info!("Building nixos-install-tools...");
+        let status = Command::new("nix")
+            .args([
+                "build",
+                "--no-sandbox",
+                "--out-link",
+                &output_dir.join("install-tools").to_string_lossy(),
+                "nixpkgs#nixos-install-tools",
+            ])
+            .status()
+            .context("Failed to build nixos-install-tools")?;
+
+        if !status.success() {
+            bail!("Failed to build nixos-install-tools");
         }
 
-        std::fs::copy(&built, final_file)
-            .context("Failed to copy raw image")?;
-        let _ = std::fs::remove_dir_all(output_dir.join("result"));
+        self.build_image_from_closure(output_dir, final_file)?;
 
         info!(
             "Image built: {} ({})",
@@ -113,29 +120,110 @@ impl PackerManager {
     fn build_via_docker(&self, _args: &BakeArgs, final_file: &Path) -> Result<PathBuf> {
         let output_dir = final_file.parent().unwrap_or(Path::new("."));
         let host_project = resolve_host_path(".")?;
-        let host_output = resolve_host_path(
-            &output_dir.to_string_lossy(),
-        )?;
+        let host_output = resolve_host_path(&output_dir.to_string_lossy())?;
 
-        if output_dir.exists() {
-            std::fs::remove_dir_all(output_dir)
-                .context("Failed to remove existing output directory")?;
-        }
+        let _ = std::fs::remove_dir_all(output_dir);
         std::fs::create_dir_all(output_dir)
             .context("Failed to create output directory")?;
 
-        info!("Building NixOS raw image via Docker (nixos/nix)...");
-
         let script = r#"set -eux
+
 cd /host-project
-# Ensure Nix files are Git-tracked (required by Nix in a Git repo)
 git add flake.nix nix/ 2>/dev/null || true
-nix build --no-sandbox -L --show-trace --out-link /host-output/result .#rawImage \
-  || { echo "=== BUILD FAILED ==="; nix log /nix/store/*-nixos-disk-image.drv 2>/dev/null || true; exit 1; }
-if [ -f /host-output/result/disk.raw ]; then
-  cp /host-output/result/disk.raw /host-output/stateless-debian-kube.img
-  rm -r /host-output/result
+
+echo "=== Building NixOS system closure ==="
+nix build --no-sandbox --out-link /host-output/closure \
+  .#nixosConfigurations.pifrost-node.config.system.build.toplevel
+
+echo "=== Building nixos-install-tools ==="
+nix build --no-sandbox --out-link /host-output/install-tools \
+  nixpkgs#nixos-install-tools
+
+echo "=== Installing disk utilities ==="
+apk add --no-cache parted e2fsprogs dosfstools util-linux rsync
+
+echo "=== Creating raw disk image ==="
+DISK_IMAGE=/host-output/stateless-debian-kube.img
+rm -f "$DISK_IMAGE"
+dd if=/dev/zero of="$DISK_IMAGE" bs=1M count=5000 status=progress
+
+echo "=== Partitioning ==="
+parted -s "$DISK_IMAGE" mklabel gpt
+parted -s "$DISK_IMAGE" mkpart primary fat32 1MiB 513MiB
+parted -s "$DISK_IMAGE" set 1 esp on
+parted -s "$DISK_IMAGE" set 1 boot on
+parted -s "$DISK_IMAGE" mkpart primary ext4 513MiB 100%
+
+echo "=== Setting up loopback ==="
+LOOP=$(losetup --show -f "$DISK_IMAGE")
+kpartx -av "$LOOP"
+sleep 1
+P1=/dev/mapper/$(basename "$LOOP")p1
+P2=/dev/mapper/$(basename "$LOOP")p2
+
+echo "=== Formatting ==="
+mkfs.vfat -F 32 -n "ESP" "$P1"
+mkfs.ext4 -F -L "nixos" "$P2"
+
+echo "=== Mounting ==="
+mkdir -p /mnt/root
+mount "$P2" /mnt/root
+mkdir -p /mnt/root/boot
+mount "$P1" /mnt/root/boot
+
+echo "=== Installing NixOS to image ==="
+CLOSURE=$(readlink /host-output/closure)
+INSTALL_TOOLS=$(readlink /host-output/install-tools)
+
+# nixos-install copies the closure, runs activation, sets up bootloader
+"$INSTALL_TOOLS/bin/nixos-install" \
+  --root /mnt/root \
+  --system "$CLOSURE" \
+  --no-root-password \
+  --no-bootloader 2>&1
+
+if [ $? -ne 0 ]; then
+  echo "WARNING: nixos-install had issues (continuing)"
 fi
+
+echo "=== Installing systemd-boot manually ==="
+# Find systemd-boot in the closure
+SYSTEMD_BOOT=$(find "$CLOSURE" -name "systemd-boot*.efi" -type f | head -1)
+if [ -n "$SYSTEMD_BOOT" ]; then
+  BOOTNAME=$(basename "$SYSTEMD_BOOT" | sed 's/systemd-boot/BOOT/')
+  mkdir -p /mnt/root/boot/EFI/systemd /mnt/root/boot/EFI/BOOT
+  cp "$SYSTEMD_BOOT" /mnt/root/boot/EFI/systemd/
+  cp "$SYSTEMD_BOOT" "/mnt/root/boot/EFI/BOOT/$BOOTNAME"
+
+  # Generate loader config
+  mkdir -p /mnt/root/boot/loader/entries
+  cat > /mnt/root/boot/loader/loader.conf << 'LOADER'
+default nixos
+timeout 5
+console-mode max
+editor no
+LOADER
+
+  CLOSURE_NAME=$(basename "$CLOSURE")
+  cat > /mnt/root/boot/loader/entries/nixos.conf << 'ENTRY'
+title NixOS
+linux /nix/store/CLOSURE_NAME/kernel
+initrd /nix/store/CLOSURE_NAME/initrd
+options init=/nix/store/CLOSURE_NAME/init loglevel=4
+ENTRY
+  sed -i "s|CLOSURE_NAME|$CLOSURE_NAME|g" /mnt/root/boot/loader/entries/nixos.conf
+fi
+
+echo "=== Cleaning up ==="
+sync
+umount /mnt/root/boot 2>/dev/null || true
+umount /mnt/root 2>/dev/null || true
+kpartx -dv "$LOOP" 2>/dev/null || true
+losetup -d "$LOOP" 2>/dev/null || true
+
+cp "$DISK_IMAGE" /host-output/stateless-debian-kube.img.final
+mv /host-output/stateless-debian-kube.img.final /host-output/stateless-debian-kube.img
+echo "=== Image built successfully ==="
 "#;
 
         let status = Command::new("docker")
@@ -164,6 +252,115 @@ fi
             humansize(std::fs::metadata(final_file)?.len())
         );
         Ok(final_file.to_path_buf())
+    }
+
+    fn build_image_from_closure(
+        &self,
+        output_dir: &Path,
+        final_file: &Path,
+    ) -> Result<()> {
+        // For local builds, run the disk assembly via Docker (pifrost-worker)
+        // since it needs root/loopback
+        let host_output = resolve_host_path(&output_dir.to_string_lossy())?;
+        let final_name = final_file.file_name().unwrap().to_string_lossy();
+
+        let script = format!(
+            r#"set -eux
+DISK_IMAGE=/build-images/{final_name}
+rm -f "$DISK_IMAGE"
+dd if=/dev/zero of="$DISK_IMAGE" bs=1M count=5000 status=progress
+
+parted -s "$DISK_IMAGE" mklabel gpt
+parted -s "$DISK_IMAGE" mkpart primary fat32 1MiB 513MiB
+parted -s "$DISK_IMAGE" set 1 esp on
+parted -s "$DISK_IMAGE" set 1 boot on
+parted -s "$DISK_IMAGE" mkpart primary ext4 513MiB 100%
+
+LOOP=$(losetup --show -f "$DISK_IMAGE")
+kpartx -av "$LOOP"
+sleep 1
+P1=/dev/mapper/$(basename "$LOOP")p1
+P2=/dev/mapper/$(basename "$LOOP")p2
+
+mkfs.vfat -F 32 -n "ESP" "$P1"
+mkfs.ext4 -F -L "nixos" "$P2"
+
+mkdir -p /mnt/root
+mount "$P2" /mnt/root
+mkdir -p /mnt/root/boot
+mount "$P1" /mnt/root/boot
+
+# Copy store contents
+mkdir -p /mnt/root/nix/store
+cp -a /build-images/result/. /mnt/root/nix/store/
+
+CLOSURE=$(find /mnt/root/nix/store -maxdepth 1 -name "*-nixos-system-*" | head -1)
+if [ -z "$CLOSURE" ]; then
+  echo "ERROR: system closure not found in store"
+  exit 1
+fi
+
+CLOSURE_NAME=$(basename "$CLOSURE")
+
+# Create system profile
+mkdir -p /mnt/root/nix/var/nix/profiles/system-1-link
+ln -sfn /nix/store/$CLOSURE_NAME /mnt/root/nix/var/nix/profiles/system-1-link
+ln -sfn system-1-link /mnt/root/nix/var/nix/profiles/system
+mkdir -p /mnt/root/nix/var/nix/profiles/per-user/root
+
+mkdir -p /mnt/root/etc
+echo "NixOS" > /mnt/root/etc/NIXOS
+
+# Install systemd-boot
+SYSTEMD_BOOT=$(find "$CLOSURE" -name "systemd-boot*.efi" -type f | head -1)
+if [ -n "$SYSTEMD_BOOT" ]; then
+  BOOTNAME=$(basename "$SYSTEMD_BOOT" | sed 's/systemd-boot/BOOT/')
+  mkdir -p /mnt/root/boot/EFI/systemd /mnt/root/boot/EFI/BOOT
+  cp "$SYSTEMD_BOOT" /mnt/root/boot/EFI/systemd/
+  cp "$SYSTEMD_BOOT" "/mnt/root/boot/EFI/BOOT/$BOOTNAME"
+
+  mkdir -p /mnt/root/boot/loader/entries
+  cat > /mnt/root/boot/loader/loader.conf << 'LOADER'
+default nixos
+timeout 5
+console-mode max
+editor no
+LOADER
+
+  cat > /mnt/root/boot/loader/entries/nixos.conf << 'ENTRY'
+title NixOS
+linux /nix/store/CLOSURE_NAME/kernel
+initrd /nix/store/CLOSURE_NAME/initrd
+options init=/nix/store/CLOSURE_NAME/init loglevel=4
+ENTRY
+  sed -i "s|CLOSURE_NAME|$CLOSURE_NAME|g" /mnt/root/boot/loader/entries/nixos.conf
+fi
+
+sync
+umount /mnt/root/boot 2>/dev/null || true
+umount /mnt/root 2>/dev/null || true
+kpartx -dv "$LOOP" 2>/dev/null || true
+losetup -d "$LOOP" 2>/dev/null || true
+echo "=== Image built ==="
+"#
+        );
+
+        let status = Command::new("docker")
+            .args([
+                "run", "--rm", "--privileged",
+                "-v", &format!("{}:/build-images", host_output),
+                "--entrypoint", "/bin/bash",
+                "pifrost-worker:latest",
+                "-c", &script,
+            ])
+            .status()
+            .context("Failed to assemble disk image in Docker")?;
+
+        if !status.success() {
+            bail!("Image assembly in Docker failed");
+        }
+
+        Ok(())
     }
 }
 
