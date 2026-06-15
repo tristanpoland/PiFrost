@@ -1,0 +1,43 @@
+[cluster]
+name = "trident-pifrost"
+use_servers_as_workers = true
+
+[[cluster.server_nodes]]
+hostname = "KubeNodeD"
+host = "192.168.1.122"
+port = 22
+user = "trident"
+auth = "password"
+key_path = ""
+password = "1261"
+
+[[cluster.worker_nodes]]
+hostname = "KubeNodeC"
+host = "192.168.1.124"
+port = 22
+user = "trident"
+auth = "password"
+key_path = ""
+password = "1261"
+
+[[cluster.worker_nodes]]
+hostname = "KubeNodeB"
+host = "192.168.1.126"
+port = 22
+user = "trident"
+auth = "password"
+key_path = ""
+password = "1261"
+
+[rke2]
+version = "v1.32.3+rke2r1"
+extra_args = ""
+
+[hardening]
+zero_logs = true
+no_fs_bloat = true
+disable_swap = true
+
+[rancher]
+deploy = true
+hostname = "rancher.pifrost.local"
